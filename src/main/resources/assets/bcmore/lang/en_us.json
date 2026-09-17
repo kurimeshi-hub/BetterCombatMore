@@ -1,0 +1,13 @@
+{
+  "itemGroup.bcmore": "Example Mod Tab",
+  "block.bcmore.example_block": "Example Block",
+  "item.bcmore.example_item": "Example Item",
+
+  "bcmore.configuration.title": "BetterCombat: More! Configs",
+  "bcmore.configuration.section.bcmore.common.toml": "BetterCombat: More! Configs",
+  "bcmore.configuration.section.bcmore.common.toml.title": "BetterCombat: More! Configs",
+  "bcmore.configuration.items": "Item List",
+  "bcmore.configuration.logDirtBlock": "Log Dirt Block",
+  "bcmore.configuration.magicNumberIntroduction": "Magic Number Text",
+  "bcmore.configuration.magicNumber": "Magic Number"
+}
