@@ -1,0 +1,11 @@
+{
+  "key.bcmore.parry": "Parry",
+  "key.bcmore.dodge": "Dodge",
+  "key.category.bettercombatmore.main": "BC:More",
+
+  "attribute.name.bettercombatmore.dodge_distance": "Dodge Distance",
+  "attribute.name.bettercombatmore.dodge_cooldown": "Dodge Recharge Time (per charge)",
+  "attribute.name.bettercombatmore.dodge_charges": "Dodge Charges",
+  "attribute.name.bettercombatmore.parry_window": "Parry Window",
+  "attribute.name.bettercombatmore.parry_cooldown": "Parry Cooldown"
+}
