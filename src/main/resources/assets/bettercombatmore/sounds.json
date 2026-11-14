@@ -1,5 +1,4 @@
 {
-  "parry": {
-    "sounds": ["bettercombatmore:parry"]
-  }
+  "parry_weapon": { "sounds": [ "bettercombatmore:parry_weapon" ] },
+  "parry_hand":   { "sounds": [ "bettercombatmore:parry_hand" ] }
 }

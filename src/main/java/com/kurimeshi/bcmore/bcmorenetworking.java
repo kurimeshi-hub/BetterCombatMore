@@ -13,9 +13,11 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.tags.ItemTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -40,6 +42,10 @@ public final class bcmorenetworking {
     private static final double ENEMY_KNOCKBACK = 0.6;     // 相手のノックバック
     private static final double SELF_KNOCKBACK = 0.15;     // 自分のノックバック(ほんの少し)
     private static final float COUNTER_MULTIPLIER = 1.5f;  // カウンターのダメージ倍率
+    private static final float PARRY_DAMAGE_MIN = 2.0f;    // パリィ反撃ダメージの最小値(倍率・上限は属性)
+
+    // 反撃ダメージ自身が、パリィ判定やカウンター判定を再び起動しないようにする
+    private static boolean parryDamaging = false;
 
     private static final long ROLL_IFRAME_MS = 400;
     private static final long STEP_IFRAME_MS = 200;
@@ -48,8 +54,16 @@ public final class bcmorenetworking {
     private static final double AIR_ROLL_DISTANCE_MULT = 0.15;  // 空中ロールの移動距離(15%)
     private static final double TUMBLE_MIN_FALL = 3.0;          // 受け身が働く最低落下距離
 
+    // 火花が出る条件: 剣・ツールで、耐久が石以上(石=131。木=59 / 金=32 は対象外)
+    private static final int SPARK_MIN_DURABILITY = 131;
+
     // 空中ロールの方向(受け身の自動ロール用)
     private static final Map<UUID, Vec3> AIR_ROLL_DIR = new HashMap<>();
+
+    // パリィの回数(サーバー側)
+    private static final Map<UUID, Integer> PARRY_CHARGE_COUNT = new HashMap<>();
+    private static final Map<UUID, Long> PARRY_RECHARGE_START = new HashMap<>();
+    private static final long PARRY_SYNC_TOLERANCE_MS = 50;   // クライアントとの時間ずれの許容
 
     // ---- パケット定義 ----
     public record parryc2s() implements CustomPacketPayload {
@@ -90,11 +104,13 @@ public final class bcmorenetworking {
         @Override public Type<? extends CustomPacketPayload> type() { return TYPE; }
     }
 
-    public record parryshakes2c() implements CustomPacketPayload {
+    /** パリィ成功の演出指示: weapon=true なら武器ありの演出(放射状の火花) */
+    public record parryshakes2c(boolean weapon) implements CustomPacketPayload {
         public static final Type<parryshakes2c> TYPE =
                 new Type<>(Identifier.fromNamespaceAndPath(bcmore.MODID, "parry_shake_s2c"));
-        public static final StreamCodec<RegistryFriendlyByteBuf, parryshakes2c> CODEC =
-                StreamCodec.unit(new parryshakes2c());
+        public static final StreamCodec<RegistryFriendlyByteBuf, parryshakes2c> CODEC = StreamCodec.composite(
+                ByteBufCodecs.BOOL, parryshakes2c::weapon,
+                parryshakes2c::new);
         @Override public Type<? extends CustomPacketPayload> type() { return TYPE; }
     }
 
@@ -129,11 +145,14 @@ public final class bcmorenetworking {
         public static void register(RegisterPayloadHandlersEvent event) {
             PayloadRegistrar reg = event.registrar("1");
 
-            // パリィ開始(クールダウンは属性から取得)
+            // パリィ開始(回数と回復時間は属性から取得)
             reg.playToServer(parryc2s.TYPE, parryc2s.CODEC, (payload, ctx) -> ctx.enqueueWork(() -> {
                 if (!(ctx.player() instanceof ServerPlayer player)) return;
-                long cdMs = (long) (player.getAttributeValue(bcmoreattributes.PARRY_COOLDOWN) * 1000);
-                if (!combatstate.tryStartParry(player.getUUID(), cdMs)) return;
+                if (!bcmoreconfig.ENABLE_PARRY.get()) return;
+                int charges = refreshParryCharges(player);
+                if (charges <= 0) return;
+                if (!combatstate.tryStartParry(player.getUUID(), 0L)) return;   // クールダウンは回数側で管理
+                PARRY_CHARGE_COUNT.put(player.getUUID(), charges - 1);
                 PacketDistributor.sendToPlayersTrackingEntity(player, new parryanims2c(player.getUUID()));
             }));
 
@@ -148,7 +167,7 @@ public final class bcmorenetworking {
                     ctx.enqueueWork(() -> com.kurimeshi.bcmore.client.bcmoreclient.onRemoteParry(payload.player())));
 
             reg.playToClient(parryshakes2c.TYPE, parryshakes2c.CODEC, (payload, ctx) ->
-                    ctx.enqueueWork(() -> com.kurimeshi.bcmore.client.bcmoreclient.onParryShake()));
+                    ctx.enqueueWork(() -> com.kurimeshi.bcmore.client.bcmoreclient.onParryShake(payload.weapon())));
 
             reg.playToClient(dodgemoves2c.TYPE, dodgemoves2c.CODEC, (payload, ctx) ->
                     ctx.enqueueWork(() -> com.kurimeshi.bcmore.client.bcmoreclient.onDodgeMove(
@@ -162,6 +181,32 @@ public final class bcmorenetworking {
                     ctx.enqueueWork(() -> com.kurimeshi.bcmore.client.bcmoreclient.onDodgeAnim(
                             payload.player(), payload.roll())));
         }
+    }
+
+    // ---- パリィの回数まわり ----
+    /** 経過時間ぶんの回復を反映して、現在の回数を返す */
+    private static int refreshParryCharges(ServerPlayer player) {
+        UUID id = player.getUUID();
+        int max = Math.max(1, (int) Math.round(player.getAttributeValue(bcmoreattributes.PARRY_CHARGES)));
+        long cd = (long) (player.getAttributeValue(bcmoreattributes.PARRY_COOLDOWN) * 1000);
+        long now = combatstate.now();
+
+        int charges = PARRY_CHARGE_COUNT.getOrDefault(id, max);
+        long start = PARRY_RECHARGE_START.getOrDefault(id, now);
+
+        if (charges >= max || cd <= 0) {
+            charges = max;
+            start = now;   // 満タンの間は、回復の開始時刻を現在に保つ
+        } else {
+            long gained = (now - start + PARRY_SYNC_TOLERANCE_MS) / cd;
+            if (gained > 0) {
+                charges = (int) Math.min(max, charges + gained);
+                start += gained * cd;
+            }
+        }
+        PARRY_CHARGE_COUNT.put(id, charges);
+        PARRY_RECHARGE_START.put(id, start);
+        return charges;
     }
 
     // ---- 回避の回数まわり ----
@@ -188,6 +233,7 @@ public final class bcmorenetworking {
 
     // ---- 回避 ----
     private static void handleDodge(ServerPlayer player, float forward, float sideways) {
+        if (!bcmoreconfig.ENABLE_ROLL.get()) return;
         forward = Mth.clamp(forward, -1f, 1f);
         sideways = Mth.clamp(sideways, -1f, 1f);
         if (player.isSpectator() || player.isPassenger()) return;
@@ -306,6 +352,7 @@ public final class bcmorenetworking {
     // ---- ダメージ判定(パリィ / 回避無敵) ----
     @SubscribeEvent
     public static void onIncomingDamage(LivingIncomingDamageEvent event) {
+        if (parryDamaging) return;   // 反撃ダメージ中は判定しない
         if (!(event.getEntity() instanceof ServerPlayer player)) return;
         var source = event.getSource();
         if (source.getEntity() == null && source.getDirectEntity() == null) return; // 環境ダメージは対象外
@@ -318,7 +365,7 @@ public final class bcmorenetworking {
         long windowMs = (long) (player.getAttributeValue(bcmoreattributes.PARRY_WINDOW) * 1000);
         if (combatstate.isInParryWindow(player.getUUID(), windowMs)) {
             combatstate.consumeParry(player.getUUID());
-            onParrySuccess(player, source.getEntity());
+            onParrySuccess(player, source.getEntity(), event.getAmount());
             event.setCanceled(true);
         }
     }
@@ -338,6 +385,7 @@ public final class bcmorenetworking {
     // カウンター: パリィ成功後の最初の近接攻撃を 1.5 倍 + クリティカル演出
     @SubscribeEvent
     public static void onCounterDamage(LivingIncomingDamageEvent event) {
+        if (parryDamaging) return;   // 反撃ダメージ自身はカウンター扱いにしない
         var source = event.getSource();
         if (!(source.getEntity() instanceof ServerPlayer attacker)) return;
         if (source.getDirectEntity() != attacker) return;   // 近接のみ(矢などは対象外)
@@ -365,16 +413,40 @@ public final class bcmorenetworking {
         UUID id = event.getEntity().getUUID();
         combatstate.clear(id);
         AIR_ROLL_DIR.remove(id);
+        PARRY_CHARGE_COUNT.remove(id);
+        PARRY_RECHARGE_START.remove(id);
     }
 
-    // ---- パリィ成功時の演出・反動 ----
-    private static void onParrySuccess(ServerPlayer player, Entity attacker) {
+    // ---- パリィ成功時の演出・反動・反撃ダメージ ----
+
+    /** 反撃ダメージ = 受けるはずだったダメージ × 倍率(属性)。最小 2.0、上限は属性 */
+    private static float parryDamage(ServerPlayer player, float incoming) {
+        float ratio = (float) player.getAttributeValue(bcmoreattributes.PARRY_DAMAGE_RATIO);
+        float max   = (float) player.getAttributeValue(bcmoreattributes.PARRY_DAMAGE_MAX);
+        return Math.min(max, Math.max(PARRY_DAMAGE_MIN, incoming * ratio));
+    }
+
+    /** 剣・ツール(ピッケル/斧/シャベル/クワ)で、石以上の耐久なら火花が出る */
+    private static boolean canSpark(ItemStack stack) {
+        if (stack.isEmpty()) return false;
+        boolean tool = stack.is(ItemTags.SWORDS) || stack.is(ItemTags.AXES)
+                || stack.is(ItemTags.PICKAXES) || stack.is(ItemTags.SHOVELS) || stack.is(ItemTags.HOES);
+        return tool && stack.getMaxDamage() >= SPARK_MIN_DURABILITY;
+    }
+
+    private static void onParrySuccess(ServerPlayer player, Entity attacker, float incoming) {
         if (!(player.level() instanceof ServerLevel level)) return;
 
         combatstate.startCounter(player.getUUID());
 
-        level.playSound(null, player.blockPosition(), bcmoresounds.PARRY.get(), SoundSource.PLAYERS, 1.0f, 1.0f);
-        PacketDistributor.sendToPlayer(player, new parryshakes2c());
+        // メインハンドが空でなければ「武器あり」
+        boolean weapon = !player.getMainHandItem().isEmpty();
+
+        level.playSound(null, player.blockPosition(),
+                (weapon ? bcmoresounds.PARRY_WEAPON : bcmoresounds.PARRY_HAND).get(),
+                SoundSource.PLAYERS, 1.0f, 1.0f);
+        // クライアントの放射状の火花(streak)は、石以上の剣・ツールのときだけ
+        PacketDistributor.sendToPlayer(player, new parryshakes2c(canSpark(player.getMainHandItem())));
 
         // 火花(胸の高さ、視線方向に少し前から放射)
         Vec3 look = player.getLookAngle();
@@ -384,8 +456,17 @@ public final class bcmorenetworking {
                 player.getZ() + look.z * 0.8,
                 40, 0.35);
 
-        // 相手: ノックバック + 跳ねる
+        // 相手: 反撃ダメージ + ノックバック + 跳ねる
         if (attacker instanceof LivingEntity living) {
+            float dmg = parryDamage(player, incoming);
+            parryDamaging = true;
+            try {
+                living.hurtServer(level, player.damageSources().playerAttack(player), dmg);
+            } finally {
+                parryDamaging = false;
+            }
+            living.invulnerableTime = 0;   // 直後のカウンター攻撃が無敵時間で弾かれないように
+
             living.knockback(ENEMY_KNOCKBACK, player.getX() - living.getX(), player.getZ() - living.getZ());
             Vec3 av = living.getDeltaMovement();
             living.setDeltaMovement(av.x, PARRY_BOUNCE, av.z);

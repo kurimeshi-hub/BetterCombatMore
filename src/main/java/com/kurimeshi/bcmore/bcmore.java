@@ -12,6 +12,7 @@ public class bcmore {
     public bcmore(IEventBus modEventBus, ModContainer modContainer) {
         bcmoresounds.SOUNDS.register(modEventBus);
         bcmoreattributes.ATTRIBUTES.register(modEventBus);
+        bcmoreparticles.PARTICLE_TYPES.register(modEventBus);   // ← これが無い
         modContainer.registerConfig(ModConfig.Type.COMMON, bcmoreconfig.SPEC);
     }
 }

@@ -2,7 +2,9 @@ package com.kurimeshi.bcmore.client;
 
 import com.kurimeshi.bcmore.bcmore;
 import com.kurimeshi.bcmore.bcmoreattributes;
+import com.kurimeshi.bcmore.bcmoreconfig;
 import com.kurimeshi.bcmore.bcmorenetworking;
+import com.kurimeshi.bcmore.bcmoreparticles;
 import com.kurimeshi.bcmore.combatstate;
 import com.mojang.blaze3d.platform.InputConstants;
 import com.zigythebird.playeranim.animation.PlayerAnimationController;
@@ -24,14 +26,13 @@ import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.InputEvent;
 import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
+import net.neoforged.neoforge.client.event.RegisterParticleProvidersEvent;
 import net.neoforged.neoforge.client.event.ViewportEvent;
 import net.neoforged.neoforge.client.network.ClientPacketDistributor;
 import org.lwjgl.glfw.GLFW;
 
+import java.util.Arrays;
 import java.util.UUID;
-
-// 以下の2クラスの import は、IDE の Alt+Enter で正しいパッケージを選んで追加してください:
-//   FirstPersonMode, FirstPersonConfiguration
 
 @EventBusSubscriber(modid = bcmore.MODID, value = Dist.CLIENT)
 public class bcmoreclient {
@@ -50,10 +51,19 @@ public class bcmoreclient {
             new KeyMapping("key.bcmore.parry", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_G, CATEGORY);
     public static final KeyMapping DODGE_KEY =
             new KeyMapping("key.bcmore.dodge", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_R, CATEGORY);
+
     // ---- 画面揺れの設定 ----
     private static long shakeStartMs = 0;
     private static final long SHAKE_DURATION_MS = 200;   // 揺れる時間
     private static final float SHAKE_STRENGTH = 1.2f;    // 揺れの大きさ(度)
+
+    // ---- パリィ成功のパーティクル ----
+    private static final double PARRY_PARTICLE_DISTANCE = 2.0;   // 目線から何ブロック先に出すか
+    private static final int PARRY_STREAK_COUNT = 38;            // 武器ありのときの放射線の本数
+
+    // ---- パリィ成功の画面の白フラッシュ ----
+    private static final long SCREEN_FLASH_MS = 250;             // 白くなって消えるまでの時間
+    private static long screenFlashStartMs = -100000;
 
     // ---- ロールの2段階加速(1tick目 45% + 2tick目 55%) ----
     private static final double ROLL_FIRST_RATIO = 0.45;
@@ -76,6 +86,7 @@ public class bcmoreclient {
     private static double rollDx = 0;
     private static double rollDz = 0;
     private static double rollSecondSpeed = 0;
+
     // ---- ロール中の視点回転(一人称のみ) ----
     private static final long ROLL_SPIN_MS = 450;        // 1回転にかける時間
     private static final float ROLL_SPIN_DEGREES = 360f; // 回転量
@@ -87,18 +98,34 @@ public class bcmoreclient {
     private static int clientCharges = -1;          // -1 = まだ同期されていない(満タン扱い)
     private static long clientRechargeStart = 0;
 
-    // ---- 「最大になった」ときの光と音 ----
+    // ---- パリィの回数(クライアント側で予測して進める) ----
+    private static int parryCharges = -1;
+    private static long parryRechargeStart = 0;
+    private static boolean parryKeyHeld = false;    // 押しっぱなしでの連続発動を防ぐ
+
+    // ---- 「1ゲージ溜まった」ときの光と音(ゲージごとに管理) ----
     private static final long FLASH_MS = 350;
-    private static boolean rollWasMax = true;       // 起動直後に鳴らさないよう true から始める
-    private static boolean parryWasReady = true;
-    private static long rollFlashStartMs = -100000;
-    private static long parryFlashStartMs = -100000;
+    private static final int FLASH_SLOTS = 10;      // 属性の上限(10)に合わせる
+    private static final long[] rollFlashMs = new long[FLASH_SLOTS];
+    private static final long[] parryFlashMs = new long[FLASH_SLOTS];
+    private static int rollLastCharges = -1;        // -1 = 起動直後(鳴らさない)
+    private static int parryLastCharges = -1;
+    static {
+        Arrays.fill(rollFlashMs, -100000L);
+        Arrays.fill(parryFlashMs, -100000L);
+    }
 
     @SubscribeEvent
     public static void registerKeys(RegisterKeyMappingsEvent event) {
         event.registerCategory(CATEGORY);
         event.register(PARRY_KEY);
         event.register(DODGE_KEY);
+    }
+
+    @SubscribeEvent
+    public static void registerParticleProviders(RegisterParticleProvidersEvent event) {
+        event.registerSpriteSet(bcmoreparticles.PARRY_SPARK.get(), ParrySparkParticle.Provider::new);
+        event.registerSpriteSet(bcmoreparticles.PARRY_STREAK.get(), ParryStreakParticle.Provider::new);
     }
 
     @SubscribeEvent
@@ -165,33 +192,42 @@ public class bcmoreclient {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null) return;
 
-        // 回避の回数が最大になった瞬間
-        boolean rollMax = chargesNow() >= maxCharges();
-        if (rollMax && !rollWasMax) {
-            rollFlashStartMs = combatstate.now();
-            mc.player.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.6f, 1.8f);
-        }
-        rollWasMax = rollMax;
+        long nowMs = combatstate.now();
 
-        // パリィのクールダウンが明けた瞬間
-        boolean parryReady = parryProgress() >= 1f;
-        if (parryReady && !parryWasReady) {
-            parryFlashStartMs = combatstate.now();
+        // ロール: 1ゲージ溜まるごとに、そのゲージを光らせる
+        int rollCharges = chargesNow();
+        if (rollLastCharges >= 0 && rollCharges > rollLastCharges) {
+            for (int i = rollLastCharges; i < rollCharges && i < FLASH_SLOTS; i++) rollFlashMs[i] = nowMs;
             mc.player.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.6f, 1.8f);
         }
-        parryWasReady = parryReady;
+        rollLastCharges = rollCharges;
+
+        // パリィ: 同じく1ゲージごと
+        int parryNow = parryChargesNow();
+        if (parryLastCharges >= 0 && parryNow > parryLastCharges) {
+            for (int i = parryLastCharges; i < parryNow && i < FLASH_SLOTS; i++) parryFlashMs[i] = nowMs;
+            mc.player.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.6f, 1.8f);
+        }
+        parryLastCharges = parryNow;
+
+        // 長押し対策: キーを離したら、次のパリィを受け付ける
+        if (!PARRY_KEY.isDown()) parryKeyHeld = false;
 
         while (PARRY_KEY.consumeClick()) {
+            if (!bcmoreconfig.ENABLE_PARRY.get()) continue;                       // コンフィグでOFF
+            if (parryKeyHeld) continue;                                           // 押しっぱなしは不可
             long now = combatstate.now();
-            long cdMs = (long) (mc.player.getAttributeValue(bcmoreattributes.PARRY_COOLDOWN) * 1000);
             if (now - lastAttackClickMs < combatstate.ATTACK_LOCK_MS) continue;   // 攻撃直後は不可
-            if (now - parryStartMs < cdMs) continue;                              // クールダウン中
+            if (parryChargesNow() <= 0) continue;                                 // 回数切れ
+            parryKeyHeld = true;
+            parryCharges--;
             parryStartMs = now;
             parryLockCleared = false;   // 新しいパリィが始まったので、ロックを有効に戻す
             playParry(mc.player);
             ClientPacketDistributor.sendToServer(new bcmorenetworking.parryc2s());
         }
         while (DODGE_KEY.consumeClick()) {
+            if (!bcmoreconfig.ENABLE_ROLL.get()) continue;                        // コンフィグでOFF
             var move = mc.player.input.getMoveVector(); // x=左右, y=前後
             ClientPacketDistributor.sendToServer(new bcmorenetworking.dodgec2s(move.y, move.x));
         }
@@ -267,25 +303,77 @@ public class bcmoreclient {
 
     // ================= パリィのゲージ用 =================
 
-    /** パリィのクールダウンの進み具合(0.0 = 発動直後, 1.0 = 使用可能) */
-    public static float parryProgress() {
+    /** パリィの最大回数(属性) */
+    public static int parryMaxCharges() {
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null) return 1f;
-        long cdMs = (long) (mc.player.getAttributeValue(bcmoreattributes.PARRY_COOLDOWN) * 1000);
-        if (cdMs <= 0) return 1f;
-        return Math.min(1f, (combatstate.now() - parryStartMs) / (float) cdMs);
+        if (mc.player == null) return 1;
+        return Math.max(1, (int) Math.round(mc.player.getAttributeValue(bcmoreattributes.PARRY_CHARGES)));
+    }
+
+    /** パリィ1回ぶんの回復時間(ms、属性) */
+    private static long parryRechargeMs() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return 1000;
+        return (long) (mc.player.getAttributeValue(bcmoreattributes.PARRY_COOLDOWN) * 1000);
+    }
+
+    /** 経過時間ぶんの回復を反映する */
+    private static void advanceParry() {
+        int max = parryMaxCharges();
+        long cd = parryRechargeMs();
+        long n = combatstate.now();
+
+        if (parryCharges < 0 || parryCharges >= max || cd <= 0) {
+            parryCharges = max;
+            parryRechargeStart = n;   // 満タンの間は、回復の開始時刻を現在に保つ
+            return;
+        }
+        long gained = (n - parryRechargeStart) / cd;
+        if (gained > 0) {
+            parryCharges = (int) Math.min(max, parryCharges + gained);
+            parryRechargeStart += gained * cd;
+        }
+    }
+
+    /** 現在使えるパリィの回数 */
+    public static int parryChargesNow() {
+        advanceParry();
+        return parryCharges;
+    }
+
+    /** 回復中の1回ぶんの進み具合(0.0 〜 1.0)。満タンなら 1.0 */
+    public static float parryRechargeProgress() {
+        advanceParry();
+        if (parryCharges >= parryMaxCharges()) return 1f;
+        long cd = parryRechargeMs();
+        if (cd <= 0) return 1f;
+        return Math.max(0f, Math.min(1f, (combatstate.now() - parryRechargeStart) / (float) cd));
     }
 
     // ================= 光の演出 =================
 
-    /** ロールのゲージが光っているか(最大になってから FLASH_MS のあいだ true) */
-    public static boolean rollFlashing() {
-        return combatstate.now() - rollFlashStartMs < FLASH_MS;
+    /** index 番目のロールゲージが光っているか(そのゲージが溜まってから FLASH_MS のあいだ true) */
+    public static boolean rollFlashing(int index) {
+        return index >= 0 && index < FLASH_SLOTS && combatstate.now() - rollFlashMs[index] < FLASH_MS;
     }
 
-    /** パリィのゲージが光っているか */
-    public static boolean parryFlashing() {
-        return combatstate.now() - parryFlashStartMs < FLASH_MS;
+    /** index 番目のパリィゲージが光っているか */
+    public static boolean parryFlashing(int index) {
+        return index >= 0 && index < FLASH_SLOTS && combatstate.now() - parryFlashMs[index] < FLASH_MS;
+    }
+
+    /** どれかのパリィゲージが光っているか */
+    public static boolean parryAnyFlashing() {
+        for (int i = 0; i < FLASH_SLOTS; i++) if (parryFlashing(i)) return true;
+        return false;
+    }
+
+    /** 画面の白フラッシュの強さ(1.0 → 0.0 に消えていく。光っていないときは 0) */
+    public static float parryScreenFlash() {
+        long t = combatstate.now() - screenFlashStartMs;
+        if (t < 0 || t >= SCREEN_FLASH_MS) return 0f;
+        float p = 1f - t / (float) SCREEN_FLASH_MS;
+        return p * p;   // 最初に強く、すっと消える
     }
 
     // ================= 回避の移動 =================
@@ -323,10 +411,29 @@ public class bcmoreclient {
         airDecaySkipFirst = true;
     }
 
-    /** パリィ成功(S2C パケットから呼ばれる): 画面揺れ + 攻撃ロック解除(クールダウンはそのまま) */
-    public static void onParryShake() {
+    /**
+     * パリィ成功(S2C パケットから呼ばれる):
+     * 画面揺れ + 攻撃ロック解除(クールダウンはそのまま) + パーティクル。
+     * weapon=true(メインハンドに何か持っている)なら、放射状の火花の線も出す。
+     */
+    public static void onParryShake(boolean weapon) {
         shakeStartMs = System.nanoTime() / 1_000_000L;
+        screenFlashStartMs = combatstate.now();
         parryLockCleared = true;
+
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) return;
+
+        // 目線の少し先に出す
+        Vec3 pos = mc.player.getEyePosition()
+                .add(mc.player.getLookAngle().scale(PARRY_PARTICLE_DISTANCE))
+                .add(0, -0.2, 0);
+
+        mc.level.addParticle(bcmoreparticles.PARRY_SPARK.get(), pos.x, pos.y, pos.z, 0, 0, 0);
+
+        if (weapon) {
+            ParryStreakParticle.burst(mc.level, pos, PARRY_STREAK_COUNT);
+        }
     }
 
     @SubscribeEvent
@@ -364,6 +471,7 @@ public class bcmoreclient {
         if (mc.level == null) return;
         if (mc.level.getPlayerByUUID(id) instanceof AbstractClientPlayer p) playParry(p);
     }
+
     /** 回避アニメ(S2C パケットから呼ばれる)。roll=true ならロール、false ならステップ/テレポート */
     public static void onDodgeAnim(UUID id, boolean roll) {
         Minecraft mc = Minecraft.getInstance();

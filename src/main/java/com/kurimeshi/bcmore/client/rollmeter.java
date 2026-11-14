@@ -1,6 +1,7 @@
 package com.kurimeshi.bcmore.client;
 
 import com.kurimeshi.bcmore.bcmore;
+import com.kurimeshi.bcmore.bcmoreconfig;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -15,7 +16,7 @@ import net.neoforged.neoforge.client.event.RegisterGuiLayersEvent;
 /** ホットバーの左に、回避の回数ぶんの矢印ゲージを左方向へ並べる */
 @EventBusSubscriber(modid = bcmore.MODID, value = Dist.CLIENT)
 public final class rollmeter {
-    private static final int SIZE = 15;              // 画像サイズ(元の11px の3倍)
+    private static final int SIZE = 11;              // 画像サイズ(元の11px の3倍)
     private static final int GAP = -5;                // 矢印どうしのすき間
     private static final int MARGIN = 6;             // ホットバーとの間隔
     private static final int OFFHAND_WIDTH = 29;     // オフハンド枠の幅
@@ -42,7 +43,7 @@ public final class rollmeter {
 
     private static void render(GuiGraphicsExtractor g, DeltaTracker delta) {
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.options.hideGui) return;
+        if (mc.player == null || mc.options.hideGui || !bcmoreconfig.ENABLE_ROLL.get()) return;
 
         int max = bcmoreclient.maxCharges();
         int charges = bcmoreclient.chargesNow();
@@ -63,7 +64,7 @@ public final class rollmeter {
         for (int i = 0; i < max; i++) {
             Identifier tex;
             if (i < charges) {
-                tex = bcmoreclient.rollFlashing() ? FLASH : FULL;   // 使える(最大になった直後は光る)
+                tex = bcmoreclient.rollFlashing(i) ? FLASH : FULL;   // 使える(溜まった直後はそのゲージが光る)
             } else if (i == charges) {
                 tex = STAGES[Math.min(8, (int) (progress * 9f))];   // 回復中
             } else {

@@ -7,5 +7,6 @@
   "attribute.name.bettercombatmore.dodge_cooldown": "回避の回復時間(1回ぶん)",
   "attribute.name.bettercombatmore.dodge_charges": "回避回数",
   "attribute.name.bettercombatmore.parry_window": "パリィ受付時間",
-  "attribute.name.bettercombatmore.parry_cooldown": "パリィクールダウン"
+  "attribute.name.bettercombatmore.parry_cooldown": "パリィクールダウン",
+  "message.bettercombatmore.tumble": "受け身!"
 }

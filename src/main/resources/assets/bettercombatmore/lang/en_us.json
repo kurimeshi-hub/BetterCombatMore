@@ -7,5 +7,6 @@
   "attribute.name.bettercombatmore.dodge_cooldown": "Dodge Recharge Time (per charge)",
   "attribute.name.bettercombatmore.dodge_charges": "Dodge Charges",
   "attribute.name.bettercombatmore.parry_window": "Parry Window",
-  "attribute.name.bettercombatmore.parry_cooldown": "Parry Cooldown"
+  "attribute.name.bettercombatmore.parry_cooldown": "Parry Cooldown",
+  "message.bettercombatmore.tumble": "Tumble!"
 }

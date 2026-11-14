@@ -37,6 +37,21 @@ public final class bcmoreattributes {
             "parry_cooldown",
             () -> new RangedAttribute("attribute.name.bettercombatmore.parry_cooldown", 0.8, 0.0, 60.0).setSyncable(true));
 
+    /** 連続でパリィできる回数 */
+    public static final DeferredHolder<Attribute, Attribute> PARRY_CHARGES = ATTRIBUTES.register(
+            "parry_charges",
+            () -> new RangedAttribute("attribute.name.bettercombatmore.parry_charges", 1.0, 1.0, 10.0).setSyncable(true));
+
+    /** パリィ成功時の反撃ダメージ倍率(受けるはずだったダメージ × この値) */
+    public static final DeferredHolder<Attribute, Attribute> PARRY_DAMAGE_RATIO = ATTRIBUTES.register(
+            "parry_damage_ratio",
+            () -> new RangedAttribute("attribute.name.bettercombatmore.parry_damage_ratio", 0.5, 0.0, 10.0).setSyncable(true));
+
+    /** パリィ成功時の反撃ダメージの上限 */
+    public static final DeferredHolder<Attribute, Attribute> PARRY_DAMAGE_MAX = ATTRIBUTES.register(
+            "parry_damage_max",
+            () -> new RangedAttribute("attribute.name.bettercombatmore.parry_damage_max", 20.0, 0.0, 1000.0).setSyncable(true));
+
     private bcmoreattributes() {}
 
     @SubscribeEvent
@@ -45,6 +60,9 @@ public final class bcmoreattributes {
         event.add(EntityType.PLAYER, DODGE_COOLDOWN);
         event.add(EntityType.PLAYER, DODGE_CHARGES);
         event.add(EntityType.PLAYER, PARRY_WINDOW);
+        event.add(EntityType.PLAYER, PARRY_CHARGES);
         event.add(EntityType.PLAYER, PARRY_COOLDOWN);
+        event.add(EntityType.PLAYER, PARRY_DAMAGE_RATIO);
+        event.add(EntityType.PLAYER, PARRY_DAMAGE_MAX);
     }
 }
