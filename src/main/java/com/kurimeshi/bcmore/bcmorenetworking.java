@@ -18,6 +18,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -54,7 +55,7 @@ public final class bcmorenetworking {
     private static final double AIR_ROLL_DISTANCE_MULT = 0.15;  // 空中ロールの移動距離(15%)
     private static final double TUMBLE_MIN_FALL = 3.0;          // 受け身が働く最低落下距離
 
-    // 火花が出る条件: 剣・ツールで、耐久が石以上(石=131。木=59 / 金=32 は対象外)
+    // 火花が出る条件: 剣・ツールで、耐久が石以上(石=131)。金は例外で対象。木=59 は対象外
     private static final int SPARK_MIN_DURABILITY = 131;
 
     // 空中ロールの方向(受け身の自動ロール用)
@@ -93,13 +94,15 @@ public final class bcmorenetworking {
         @Override public Type<? extends CustomPacketPayload> type() { return TYPE; }
     }
 
-    /** 回避アニメの再生指示: roll=true ならロール、false ならステップ/テレポート */
-    public record dodgeanims2c(UUID player, boolean roll) implements CustomPacketPayload {
+    /** 回避アニメの再生指示: roll=true ならロール(back=true で後ろロール)、false ならステップ/テレポート。bodyYaw はロール中の体の向き */
+    public record dodgeanims2c(UUID player, boolean roll, boolean back, float bodyYaw) implements CustomPacketPayload {
         public static final Type<dodgeanims2c> TYPE =
                 new Type<>(Identifier.fromNamespaceAndPath(bcmore.MODID, "dodge_anim_s2c"));
         public static final StreamCodec<RegistryFriendlyByteBuf, dodgeanims2c> CODEC = StreamCodec.composite(
                 UUIDUtil.STREAM_CODEC, dodgeanims2c::player,
                 ByteBufCodecs.BOOL, dodgeanims2c::roll,
+                ByteBufCodecs.BOOL, dodgeanims2c::back,
+                ByteBufCodecs.FLOAT, dodgeanims2c::bodyYaw,
                 dodgeanims2c::new);
         @Override public Type<? extends CustomPacketPayload> type() { return TYPE; }
     }
@@ -179,7 +182,7 @@ public final class bcmorenetworking {
 
             reg.playToClient(dodgeanims2c.TYPE, dodgeanims2c.CODEC, (payload, ctx) ->
                     ctx.enqueueWork(() -> com.kurimeshi.bcmore.client.bcmoreclient.onDodgeAnim(
-                            payload.player(), payload.roll())));
+                            payload.player(), payload.roll(), payload.back(), payload.bodyYaw())));
         }
     }
 
@@ -284,7 +287,20 @@ public final class bcmorenetworking {
 
         // 回避アニメ(ロール = roll / ステップ・テレポート = step)を自分と周りに送る
         PacketDistributor.sendToPlayersTrackingEntityAndSelf(player,
-                new dodgeanims2c(id, mode == combatstate.DODGE_ROLL));
+                rollAnimPacket(player, mode == combatstate.DODGE_ROLL, dir));
+    }
+
+    /**
+     * 回避アニメのパケットを作る。
+     * 後ろ向き(向きに対して後ろ寄り)なら back=true(逆再生アニメ)で、体は正面のまま。
+     * それ以外は、体を移動方向へ向けて前転する(横ロールが斜めにならない)。
+     */
+    private static dodgeanims2c rollAnimPacket(ServerPlayer player, boolean roll, Vec3 dir) {
+        float yaw = player.getYRot() * Mth.DEG_TO_RAD;
+        Vec3 fwd = new Vec3(-Mth.sin(yaw), 0, Mth.cos(yaw));
+        boolean back = dir.dot(fwd) < -0.5;
+        float bodyYaw = back ? player.getYRot() : (float) Math.toDegrees(Math.atan2(-dir.x, dir.z));
+        return new dodgeanims2c(player.getUUID(), roll, back, bodyYaw);
     }
 
     /** 壁の手前まで進んで瞬間移動する。元の位置に白い残像を残す */
@@ -346,7 +362,7 @@ public final class bcmorenetworking {
                 SoundSource.PLAYERS, 0.6f, 1.2f);
 
         // 自動ロールのアニメ
-        PacketDistributor.sendToPlayersTrackingEntityAndSelf(player, new dodgeanims2c(id, true));
+        PacketDistributor.sendToPlayersTrackingEntityAndSelf(player, rollAnimPacket(player, true, dir));
     }
 
     // ---- ダメージ判定(パリィ / 回避無敵) ----
@@ -426,12 +442,14 @@ public final class bcmorenetworking {
         return Math.min(max, Math.max(PARRY_DAMAGE_MIN, incoming * ratio));
     }
 
-    /** 剣・ツール(ピッケル/斧/シャベル/クワ)で、石以上の耐久なら火花が出る */
+    /** 剣・ツール(ピッケル/斧/シャベル/クワ)で、石以上の耐久(または金)なら火花が出る */
     private static boolean canSpark(ItemStack stack) {
         if (stack.isEmpty()) return false;
         boolean tool = stack.is(ItemTags.SWORDS) || stack.is(ItemTags.AXES)
                 || stack.is(ItemTags.PICKAXES) || stack.is(ItemTags.SHOVELS) || stack.is(ItemTags.HOES);
-        return tool && stack.getMaxDamage() >= SPARK_MIN_DURABILITY;
+        boolean gold = stack.is(Items.GOLDEN_SWORD) || stack.is(Items.GOLDEN_AXE)
+                || stack.is(Items.GOLDEN_PICKAXE) || stack.is(Items.GOLDEN_SHOVEL) || stack.is(Items.GOLDEN_HOE);
+        return tool && (gold || stack.getMaxDamage() >= SPARK_MIN_DURABILITY);   // 金は耐久が低いが例外で対象
     }
 
     private static void onParrySuccess(ServerPlayer player, Entity attacker, float incoming) {

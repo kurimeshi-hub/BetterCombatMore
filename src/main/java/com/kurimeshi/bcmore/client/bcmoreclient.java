@@ -32,6 +32,8 @@ import net.neoforged.neoforge.client.network.ClientPacketDistributor;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 @EventBusSubscriber(modid = bcmore.MODID, value = Dist.CLIENT)
@@ -42,6 +44,8 @@ public class bcmoreclient {
             Identifier.fromNamespaceAndPath(bcmore.MODID, "animation.parry");
     private static final Identifier ROLL_ANIM_ID =
             Identifier.fromNamespaceAndPath(bcmore.MODID, "animation.roll");
+    private static final Identifier ROLL_BACK_ANIM_ID =
+            Identifier.fromNamespaceAndPath(bcmore.MODID, "animation.roll_back");
     private static final Identifier STEP_ANIM_ID =
             Identifier.fromNamespaceAndPath(bcmore.MODID, "animation.step");
     private static final KeyMapping.Category CATEGORY =
@@ -87,12 +91,10 @@ public class bcmoreclient {
     private static double rollDz = 0;
     private static double rollSecondSpeed = 0;
 
-    // ---- ロール中の視点回転(一人称のみ) ----
-    private static final long ROLL_SPIN_MS = 450;        // 1回転にかける時間
-    private static final float ROLL_SPIN_DEGREES = 360f; // 回転量
-    private static long rollSpinStartMs = -100000;
-    private static float rollSpinFwd = 0f;               // 前後の成分(+1 前転 / -1 後転)
-    private static float rollSpinSide = 0f;              // 左右の成分
+    // ---- ロール中の体の向きの固定(横ロールが斜めにならないように) ----
+    private static final long ROLL_BODY_LOCK_MS = 500;   // 向きを固定する時間(ロールの長さに合わせて調整)
+    private record BodyLock(float yaw, long endMs) {}
+    private static final Map<UUID, BodyLock> bodyLocks = new HashMap<>();
 
     // ---- 回避の回数(サーバーの値を同期して、時間経過はこちらで進める) ----
     private static int clientCharges = -1;          // -1 = まだ同期されていない(満タン扱い)
@@ -193,6 +195,21 @@ public class bcmoreclient {
         if (mc.player == null) return;
 
         long nowMs = combatstate.now();
+
+        // ロール中は、体の向きを固定する(自分も他プレイヤーも)
+        if (!bodyLocks.isEmpty()) {
+            var it = bodyLocks.entrySet().iterator();
+            while (it.hasNext()) {
+                var e = it.next();
+                var target = mc.level == null ? null : mc.level.getPlayerByUUID(e.getKey());
+                if (target == null || nowMs >= e.getValue().endMs()) {
+                    it.remove();
+                    continue;
+                }
+                target.yBodyRot = e.getValue().yaw();
+                target.yBodyRotO = e.getValue().yaw();
+            }
+        }
 
         // ロール: 1ゲージ溜まるごとに、そのゲージを光らせる
         int rollCharges = chargesNow();
@@ -396,12 +413,6 @@ public class bcmoreclient {
             rollDz = dz;
             rollSecondSpeed = speed * ROLL_SECOND_RATIO;
             rollSecondPending = true;
-
-            // 視点回転: 回避方向を、向いている方向を基準に前後・左右へ分解する
-            float yawRad = mc.player.getYRot() * (float) (Math.PI / 180.0);
-            rollSpinFwd = dx * -(float) Math.sin(yawRad) + dz * (float) Math.cos(yawRad);
-            rollSpinSide = dx * (float) Math.cos(yawRad) + dz * (float) Math.sin(yawRad);
-            rollSpinStartMs = combatstate.now();
         } else {
             rollSecondPending = false;
             mc.player.setDeltaMovement(dx * speed, v.y, dz * speed);
@@ -438,8 +449,6 @@ public class bcmoreclient {
 
     @SubscribeEvent
     public static void onCameraAngles(ViewportEvent.ComputeCameraAngles event) {
-        Minecraft mc = Minecraft.getInstance();
-
         // ---- パリィ成功の画面揺れ ----
         long elapsed = System.nanoTime() / 1_000_000L - shakeStartMs;
         if (elapsed >= 0 && elapsed <= SHAKE_DURATION_MS) {
@@ -451,18 +460,6 @@ public class bcmoreclient {
             event.setYaw(event.getYaw() + (float) Math.cos(t * 1.9) * SHAKE_STRENGTH * 0.6f * decay);
             event.setRoll(event.getRoll() + (float) Math.sin(t * 3.1) * SHAKE_STRENGTH * 0.8f * decay);
         }
-
-        // ---- ロール中の視点回転(一人称のみ) ----
-        if (!mc.options.getCameraType().isFirstPerson()) return;
-        long spin = combatstate.now() - rollSpinStartMs;
-        if (spin < 0 || spin >= ROLL_SPIN_MS) return;
-
-        float p = spin / (float) ROLL_SPIN_MS;                        // 0 → 1
-        float eased = 0.5f - 0.5f * (float) Math.cos(Math.PI * p);    // ゆっくり始まり、ゆっくり終わる
-        float angle = ROLL_SPIN_DEGREES * eased;
-
-        event.setPitch(event.getPitch() + angle * rollSpinFwd);       // 前転・後転
-        event.setRoll(event.getRoll() - angle * rollSpinSide);        // 横回転
     }
 
     /** 他プレイヤーのパリィアニメ(S2C パケットから呼ばれる) */
@@ -472,12 +469,21 @@ public class bcmoreclient {
         if (mc.level.getPlayerByUUID(id) instanceof AbstractClientPlayer p) playParry(p);
     }
 
-    /** 回避アニメ(S2C パケットから呼ばれる)。roll=true ならロール、false ならステップ/テレポート */
-    public static void onDodgeAnim(UUID id, boolean roll) {
+    /**
+     * 回避アニメ(S2C パケットから呼ばれる)。
+     * roll=true ならロール(back=true なら後ろロール用の逆再生アニメ)、false ならステップ/テレポート。
+     * bodyYaw: ロール中に固定する体の向き(度)。
+     */
+    public static void onDodgeAnim(UUID id, boolean roll, boolean back, float bodyYaw) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null) return;
         if (mc.level.getPlayerByUUID(id) instanceof AbstractClientPlayer p) {
-            playAnim(p, roll ? ROLL_ANIM_ID : STEP_ANIM_ID);
+            if (roll) {
+                bodyLocks.put(id, new BodyLock(bodyYaw, combatstate.now() + ROLL_BODY_LOCK_MS));
+                playAnim(p, back ? ROLL_BACK_ANIM_ID : ROLL_ANIM_ID);
+            } else {
+                playAnim(p, STEP_ANIM_ID);
+            }
         }
     }
 
